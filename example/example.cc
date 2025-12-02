@@ -14,7 +14,8 @@ using namespace std::string_literals;
 static void filter_graph_example(Graph &g)
 {
     // use predicate (f(vertex_t) -> bool) to filter the graph by object type "Cache"
-    std::function<bool(vertex_t)> predicate = [&](vertex_t v) { return g[v].is_a<Cache>(); };
+    //std::function<bool(vertex_t)> predicate = [&](vertex_t v) { return g[v].is_a<Cache>() || g[v].is_a<PhysicalCore>(); };
+    std::function<bool(vertex_t)> predicate = [&](vertex_t v) { return true; };
 
     // edges are filtered by predicate "boost::keep_all{}" (keeping all edges)
     // vertices are filtered by predicate "predicate"
