@@ -8,6 +8,10 @@ add_executable(example-gpu "example-gpu.cc")
 target_link_libraries(example-gpu yloc)
 target_include_directories(example-gpu PRIVATE)
 
+add_executable(example-c2c-latency "example-c2c-latency.cc")
+target_link_libraries(example-c2c-latency yloc)
+target_include_directories(example-c2c-latency PRIVATE)
+
 # MPI example
 find_package(MPI)
 if(${MPI_FOUND})

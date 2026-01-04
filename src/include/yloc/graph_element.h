@@ -113,7 +113,8 @@ namespace yloc
     enum class edge_type : int { PARENT,
                                  CHILD,
                                  GPU_INTERCONNECT,
-                                 EDGE_TYPE_MAX };
+                                 EDGE_TYPE_MAX,
+                                C2C_MEASUREMENT };
 
     struct Edge : public GraphElement {
         Edge(edge_type type) : m_edgetype{type} {}
