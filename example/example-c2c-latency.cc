@@ -7,6 +7,11 @@
 
 #include <memory>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <pthread.h>
+#include <algorithm>
 
 using namespace yloc;
 using namespace std::string_literals;
@@ -49,22 +54,146 @@ namespace yloc
         auto mask1 = g[v1].get<AffinityMask>("cpu_affinity_mask").value();
         auto mask2 = g[v2].get<AffinityMask>("cpu_affinity_mask").value();
 
-        // mask1, mask2 convertible to cpu_set_t
+        // Convert to cpu_set_t
+        cpu_set_t cs1 = mask1;
+        cpu_set_t cs2 = mask2;
 
-        // start thread1 -> sched_setaffinity(mask1)
-        // start thread2 -> sched_setaffinity(mask2)
+        // Ping-pong using two threads to measure round-trip latency.
+        constexpr size_t rounds = 10000;
+        std::atomic<int> ping{0};
+        std::atomic<int> pong{0};
+        std::atomic<uint64_t> reply_ts_ns{0};
+        std::atomic<uint64_t> acc_rtt_ns{0};
 
-        // run c2c code between thread1, thread2
-        uint64_t latency; /* = TODO */
+        auto thread_fn1 = [&]() {
+            // pin this thread to cs1
+            pthread_t tid = pthread_self();
+            pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cs1);
 
-        return latency;
+            for (int i = 1; i <= static_cast<int>(rounds); ++i) {
+                // record timestamp, signal ping
+                auto now = std::chrono::high_resolution_clock::now();
+                uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+                // write ping id (i) and wait for reply
+                ping.store(i, std::memory_order_seq_cst);
+
+                // busy-wait for pong
+                while (pong.load(std::memory_order_seq_cst) != i) {
+                }
+
+                // read reply timestamp
+                uint64_t t_reply = reply_ts_ns.load(std::memory_order_seq_cst);
+                // compute RTT and accumulate
+                uint64_t rtt = t_reply > ns ? (t_reply - ns) : 0;
+                acc_rtt_ns.fetch_add(rtt, std::memory_order_seq_cst);
+            }
+        };
+
+        auto thread_fn2 = [&]() {
+            // pin this thread to cs2
+            pthread_t tid = pthread_self();
+            pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cs2);
+
+            for (int i = 1; i <= static_cast<int>(rounds); ++i) {
+                // wait for ping
+                while (ping.load(std::memory_order_seq_cst) != i) {
+                    ;
+                }
+
+                    // on receive, record timestamp and signal pong
+                    auto now = std::chrono::high_resolution_clock::now();
+                    uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+                    // store timestamp for requester
+                    reply_ts_ns.store(ns, std::memory_order_seq_cst);
+                    pong.store(i, std::memory_order_seq_cst);
+            }
+        };
+
+        // reset counters
+        ping.store(0);
+        pong.store(0);
+        reply_ts_ns.store(0);
+
+        std::thread t2(thread_fn2);
+        std::thread t1(thread_fn1);
+
+        t1.join();
+        t2.join();
+
+        // acc_rtt_ns accumulated sum of RTTs (ns); compute average one-way latency
+        uint64_t total_rtt_ns = acc_rtt_ns.load(std::memory_order_seq_cst);
+        uint64_t avg_rtt_ns = total_rtt_ns / rounds;
+        uint64_t one_way_ns = avg_rtt_ns / 2;
+
+        return one_way_ns; // nanoseconds
     }
 
     uint64_t measure_c2c_bandwidth(yloc::Graph &g, vertex_t v1, vertex_t v2)
     {
-        uint64_t bandwidth; /* = TODO */
+        auto mask1 = g[v1].get<AffinityMask>("cpu_affinity_mask").value();
+        auto mask2 = g[v2].get<AffinityMask>("cpu_affinity_mask").value();
+        cpu_set_t cs1 = mask1;
+        cpu_set_t cs2 = mask2;
 
-        return bandwidth;
+        // Triad benchmark: A = B + scalar * C
+        // We'll run two threads pinned to the two cores, each operating on disjoint halves
+        const size_t cache_capacity = 32000; 
+        const size_t total_elems = cache_capacity/24; // ~64MB per array (double)
+        const size_t elems_per_thread = total_elems / 2;
+        const size_t iterations = 5;
+        const double scalar = 3.0;
+
+        // allocate arrays (single allocation for A,B,C)
+        std::vector<double> A(total_elems);
+        std::vector<double> B(total_elems);
+        std::vector<double> C(total_elems);
+
+        // initialize
+        std::fill(B.begin(), B.end(), 1.0);
+        std::fill(C.begin(), C.end(), 2.0);
+
+        std::atomic<uint64_t> bw_acc_bytes_per_s{0};
+
+        auto triad_worker = [&](size_t offset, size_t len, cpu_set_t cs) {
+            // pin
+            pthread_t tid = pthread_self();
+            pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cs);
+
+            // warmup
+            for (size_t i = offset; i < offset + len; ++i) {
+                A[i] = B[i] + scalar * C[i];
+            }
+
+            // timed iterations
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (size_t it = 0; it < iterations; ++it) {
+                for (size_t i = offset; i < offset + len; ++i) {
+                    A[i] = B[i] + scalar * C[i];
+                }
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            double elapsed_s = std::chrono::duration_cast<std::chrono::duration<double>>(t1 - t0).count();
+
+            // bytes per element: read B (8), read C (8), write A (8) = 24 bytes
+            uint64_t bytes = static_cast<uint64_t>(len) * 24ull * static_cast<uint64_t>(iterations);
+            // compute bytes/s for this worker and accumulate into integer atomic
+            uint64_t bw = static_cast<uint64_t>(static_cast<double>(bytes) / elapsed_s);
+            bw_acc_bytes_per_s.fetch_add(bw, std::memory_order_seq_cst);
+        };
+
+        // spawn two workers
+        std::thread w1(triad_worker, 0ul, elems_per_thread, cs1);
+        std::thread w2(triad_worker, elems_per_thread, elems_per_thread, cs2);
+
+        w1.join();
+        w2.join();
+
+        // bytes_processed now holds sum of bytes/s from both workers
+        uint64_t agg_bw_bytes_per_s = bw_acc_bytes_per_s.load(std::memory_order_seq_cst);
+        // convert to bits/s
+        uint64_t agg_bw_bits_per_s = agg_bw_bytes_per_s * 8ull;
+        return agg_bw_bits_per_s;
     }
 
     void module_c2c_init()
@@ -83,10 +212,6 @@ namespace yloc
                     /* measure c2c latency / bandwidth between v1 and v2 */
                     auto latency = measure_c2c_latency(g, v1, v2);
                     auto bandwidth = measure_c2c_bandwidth(g, v1, v2);
-
-                    // dummy values
-                    latency = v1 + v2;
-                    bandwidth = v1 * v2;
 
                     /* add adapter for latency / bandwidth */
                     /* set measurement value of latency / bandwidth in c2c_edge */

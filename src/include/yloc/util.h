@@ -64,13 +64,10 @@ namespace yloc
             boost::get(boost::vertex_index, g));
 
         auto epmt = boost::make_transform_value_property_map(
-            [&](edge_type edgetype) {
+            [&](const Edge &e) {
                 std::stringstream ss{};
                 if (edge_labels) {
-                    switch (edgetype) {
-                    case edge_type::PARENT:
-                        ss << "parent";
-                        break;
+                    switch (e.m_edgetype) {
                     case edge_type::CHILD:
                         ss << "child";
                         break;
@@ -81,11 +78,54 @@ namespace yloc
                         break;
                     }
                 }
+                if (e.m_edgetype == edge_type::C2C_MEASUREMENT) {
+                    auto lat = e.get<uint64_t>("latency");
+                    if (lat.has_value()) {
+                        ss << "latency = " << lat.value() << " ns";
+                    }
+                }
+                if (e.m_edgetype == edge_type::PARENT) {
+                    auto bw = e.get<uint64_t>("bandwidth");
+                    if (bw.has_value()) {
+                        ss << "bandwidth = " << bw.value() << " MB/s";
+                    }
+                }                
                 return ss.str();
             },
-            boost::get(&Edge::m_edgetype, g));
+            boost::get(boost::edge_bundle, g));
 
-        boost::write_graphviz(ofs, g, boost::make_label_writer(vpmt), boost::make_label_writer(epmt));
+        // Collect nodes by type for ranking
+        std::vector<vertex_t> l3_caches, l2_caches, l1_caches;
+        for (auto vd : vertex_range(g)) {
+            if (g[vd].template is_a<L3Cache>()) {
+                l3_caches.push_back(vd);
+            } else if (g[vd].template is_a<L2Cache>()) {
+                l2_caches.push_back(vd);
+            } else if (g[vd].template is_a<L1Cache>()) {
+                l1_caches.push_back(vd);
+            }
+        }
+
+        auto graph_writer = [&](std::ostream &out) {
+            out << "overlap=false;\n";
+            out << "splines=polyline;\n";
+            if (!l3_caches.empty()) {
+                out << "{ rank=same; ";
+                for (auto vd : l3_caches) out << vd << "; ";
+                out << "}\n";
+            }
+            if (!l2_caches.empty()) {
+                out << "{ rank=same; ";
+                for (auto vd : l2_caches) out << vd << "; ";
+                out << "}\n";
+            }
+            if (!l1_caches.empty()) {
+                out << "{ rank=same; ";
+                for (auto vd : l1_caches) out << vd << "; ";
+                out << "}\n";
+            }
+        };
+        boost::write_graphviz(ofs, g, boost::make_label_writer(vpmt), boost::make_label_writer(epmt), graph_writer);
     }
 
 
