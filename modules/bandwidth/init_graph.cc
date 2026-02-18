@@ -7,9 +7,6 @@
 
 #include <memory>
 #include <vector>
-#include <thread>
-#include <atomic>
-#include <chrono>
 #include <pthread.h>
 #include <algorithm>
 #include <unistd.h>
@@ -45,73 +42,62 @@ using namespace std::string_literals;
         if (l2 <= 0) l2 = fallback_l2;
         if (l3 <= 0) l3 = fallback_l3;
 
-        const size_t L1 = static_cast<size_t>(l1) / sizeof(double);
-        const size_t L2 = static_cast<size_t>(l2) / sizeof(double);
-        const size_t L3 = static_cast<size_t>(l3) / sizeof(double);
-        const size_t large_cache = 1024 * 1024 * 1024 / sizeof(double); // 1GB
+        const size_t L1 = static_cast<size_t>(l1) / (3.0 * sizeof(double));
+        const size_t L2 = static_cast<size_t>(l2) / (3.0 * sizeof(double));
+        const size_t L3 = static_cast<size_t>(l3) / (3.0 * sizeof(double));
 
         const double scalar = 3.0;
 
-        std::atomic<uint64_t> bw_acc_bytes_per_s{0};
-
         // run the worker multiple times
-        std::vector<size_t> run_sizes = { L1, L2, L3, large_cache};
-        std::vector<size_t> iterations_per_level = { 100000, 1000, 100, 10 }; // mehr Iterationen für kleine Arrays
+        std::vector<size_t> run_sizes = { L1/2, L2/2, L3/2, 4*L3};
+        std::vector<size_t> iterations_per_level = { 100000, 2000, 400, 10 }; // mehr Iterationen für kleine Arrays
 
         BandwidthResult bw_res{0.0, 0.0, 0.0, 0.0};
 
         for (size_t i = 0; i < run_sizes.size(); ++i) {
-            bw_acc_bytes_per_s.store(0, std::memory_order_relaxed);
-            size_t run_len = run_sizes[i];
-            if (run_len == 0) continue;
+            const size_t len = run_sizes[i];
+            const size_t iters = iterations_per_level[i];
 
-            // allocate per-run so A/B/C sizes match the current working set
-            std::vector<double> A(run_len);
-            std::vector<double> B(run_len);
-            std::vector<double> C(run_len);
+            std::vector<double> A(len), B(len), C(len);
+
             std::fill(B.begin(), B.end(), 1.0);
             std::fill(C.begin(), C.end(), 2.0);
 
-            auto triad_worker = [&](size_t offset, size_t len, cpu_set_t cs) {
-                // pin
-                pthread_t tid = pthread_self();
-                pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cs);
+            // pin thread
+            pthread_t tid = pthread_self();
+            pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cs1);
 
-                // warmup
-                for (size_t i = offset; i < offset + len; ++i) {
+            // warmup
+            for (size_t i = 0; i < len; ++i){
+                A[i] = B[i] + scalar * C[i];
+            }
+
+            clock_gettime(CLOCK_MONOTONIC_RAW, &t0);
+
+            for (size_t it = 0; it < iters; ++it) {
+                #pragma GCC ivdep
+                for (size_t i = 0; i < len; ++i) {
                     A[i] = B[i] + scalar * C[i];
                 }
+            }
 
-                // timed iterations
-                clock_gettime(CLOCK_MONOTONIC_RAW, &t0);
-                for (size_t it = 0; it < iterations_per_level[i]; ++it) {
-                    for (size_t i = offset; i < offset + len; ++i) {
-                        A[i] = B[i] + scalar * C[i];
-                    }
-                }
-                clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
+            clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
 
-                double elapsed_s = static_cast<double>(t1.tv_sec - t0.tv_sec) + static_cast<double>(t1.tv_nsec - t0.tv_nsec) * 1e-9;
+            double elapsed_s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
 
-                // bytes per element: read B (8), read C (8), write A (8) = 24 bytes
-                uint64_t bytes = static_cast<uint64_t>(len) * 24ull * static_cast<uint64_t>(iterations_per_level[i]);
-                // compute bytes/s for this worker and accumulate into integer atomic
-                uint64_t bw = static_cast<uint64_t>(static_cast<double>(bytes) / elapsed_s);
-                bw_acc_bytes_per_s.fetch_add(bw, std::memory_order_seq_cst);
-            };
+            // 32 bytes per element
+            double bytes = static_cast<double>(len) * static_cast<double>(iters) * 32.0;
 
-            std::thread w(triad_worker, 0ul, run_len, cs1);
-            w.join();
-            double bw_mib_per_s = static_cast<double>(bw_acc_bytes_per_s.load()) / (1024.0*1024.0);
-
+            double bw_gb_per_s = bytes / elapsed_s / (1024.0 * 1024.0 * 1024.0);
             // Wert der richtigen Kante zuordnen
-            switch(i) {
-                case 0: bw_res.core_to_L1 = bw_mib_per_s; break;
-                case 1: bw_res.L1_to_L2   = bw_mib_per_s; break;
-                case 2: bw_res.L2_to_L3   = bw_mib_per_s; break;
-                case 3: bw_res.L3_to_mem  = bw_mib_per_s; break;
+            switch (i) {
+                case 0: bw_res.core_to_L1 = bw_gb_per_s; break;
+                case 1: bw_res.L1_to_L2   = bw_gb_per_s; break;
+                case 2: bw_res.L2_to_L3   = bw_gb_per_s; break;
+                case 3: bw_res.L3_to_mem  = bw_gb_per_s; break;
             }
         }
+
         return bw_res;
     }
 
@@ -126,39 +112,41 @@ using namespace std::string_literals;
         for (auto v : yloc::vertex_range(cores)) {
             /* measure bandwidth for v */
             auto bandwidth = measure_bandwidth(g, v);
+            vertex_t l1 = vertex_t{};
+            vertex_t l2 = vertex_t{};
+            vertex_t l3 = vertex_t{};
 
         // Core -> L1 Parent-Edge
         for (auto e : yloc::edge_range(g)) {
-            if (g[e].m_edgetype == edge_type::PARENT && g[target(e,g)].is_a<L1Cache>()) {
+            if (g[e].m_edgetype == edge_type::PARENT && g[target(e,g)].is_a<L1Cache>() && source(e,g) == v) {
                 auto adapter = std::make_shared<BWAdapter>(bandwidth.core_to_L1);
                 g[e].add_adapter(adapter);
+                l1 = target(e,g);
             }
         }
         // L1 -> L2 Parent-Edge
         for (auto e : yloc::edge_range(g)) {
-            if (g[e].m_edgetype == edge_type::PARENT && g[target(e,g)].is_a<L2Cache>()) {
+            if (g[e].m_edgetype == edge_type::PARENT && g[target(e,g)].is_a<L2Cache>() && source(e,g) == l1) {
                 auto adapter = std::make_shared<BWAdapter>(bandwidth.L1_to_L2);
                 g[e].add_adapter(adapter);
+                l2 = target(e,g);
             }
         }
         // L2 -> L3 Parent-Edge
         for (auto e : yloc::edge_range(g)) {
-            if (g[e].m_edgetype == edge_type::PARENT && g[target(e,g)].is_a<L3Cache>()) {
+            if (g[e].m_edgetype == edge_type::PARENT && g[target(e,g)].is_a<L3Cache>() && source(e,g) == l2) {
                 auto adapter = std::make_shared<BWAdapter>(bandwidth.L2_to_L3);
                 g[e].add_adapter(adapter);
+                l3 = target(e,g);
             }
         }
         // L3 -> MEM Parent-Edge
         for (auto e : yloc::edge_range(g)) {
-            if (g[e].m_edgetype == edge_type::PARENT && g[target(e,g)].is_a<Memory>()) {
+            if (g[e].m_edgetype == edge_type::PARENT && g[target(e,g)].is_a<Misc>() && source(e,g) == l3) {
                 auto adapter = std::make_shared<BWAdapter>(bandwidth.L3_to_mem);
                 g[e].add_adapter(adapter);
             }
         }
-            /* add adapter for bandwidth */
-            /* set measurement value of bandwidth in vertex */
-            //auto adapter = std::make_shared<BWAdapter>(bandwidth);
-            //g[v].add_adapter(adapter);
         }
     }
 

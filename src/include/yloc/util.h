@@ -87,7 +87,7 @@ namespace yloc
                 if (e.m_edgetype == edge_type::PARENT) {
                     auto bw = e.get<uint64_t>("bandwidth");
                     if (bw.has_value()) {
-                        ss << "bandwidth = " << bw.value() << " MB/s";
+                        ss << "bandwidth = " << bw.value() << " GB/s";
                     }
                 }                
                 return ss.str();
